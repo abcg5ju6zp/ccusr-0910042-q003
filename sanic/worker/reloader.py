@@ -11,7 +11,7 @@ from signal import SIGINT, SIGTERM
 from signal import signal as signal_func
 from time import sleep
 
-from sanic.server.events import trigger_events
+from sanic.startup.dependencies import run_process_event
 from sanic.worker.loader import AppLoader
 
 
@@ -42,8 +42,10 @@ class Reloader:
         before_trigger = app.listeners.get("before_reload_trigger")
         after_trigger = app.listeners.get("after_reload_trigger")
         loop = new_event_loop()
-        if reloader_start:
-            trigger_events(reloader_start, loop, app)
+        if reloader_start or app.listener_orchestrator.has(
+            "reload_process_start"
+        ):
+            run_process_event(app, "reload_process_start", loop)
 
         while self.run:
             changed = set()
@@ -59,15 +61,25 @@ class Reloader:
                 except OSError:
                     continue
             if changed:
-                if before_trigger:
-                    trigger_events(before_trigger, loop, app)
+                if before_trigger or app.listener_orchestrator.has(
+                    "before_reload_trigger"
+                ):
+                    run_process_event(app, "before_reload_trigger", loop)
                 self.reload(",".join(changed) if changed else "unknown")
-                if after_trigger:
-                    trigger_events(after_trigger, loop, app, changed=changed)
+                if after_trigger or app.listener_orchestrator.has(
+                    "after_reload_trigger"
+                ):
+                    run_process_event(
+                        app, "after_reload_trigger", loop, changed=changed
+                    )
             sleep(self.interval)
         else:
-            if reloader_stop:
-                trigger_events(reloader_stop, loop, app)
+            if reloader_stop or app.listener_orchestrator.has(
+                "reload_process_stop"
+            ):
+                run_process_event(
+                    app, "reload_process_stop", loop, reverse=True
+                )
 
     def stop(self, *_):
         self.run = False

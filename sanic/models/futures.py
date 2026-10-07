@@ -35,6 +35,10 @@ class FutureListener(NamedTuple):
     listener: ListenerType
     event: str
     priority: int
+    name: str | None = None
+    depends: frozenset[str] = frozenset()
+    rollback: Callable | None = None
+    on_failure: str = "abort"
 
 
 class FutureMiddleware(NamedTuple):

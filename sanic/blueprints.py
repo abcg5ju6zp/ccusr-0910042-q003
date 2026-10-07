@@ -376,7 +376,11 @@ class Blueprint(BaseSanic):
         for future in self._future_listeners:
             if (self, future) in app._future_registry:
                 continue
-            listeners[future.event].append(app._apply_listener(future))
+            app._apply_listener(future)
+            if future.name or future.depends or future.rollback is not None:
+                # 受管监听器已进入依赖编排，不进入普通 listeners 列表。
+                continue
+            listeners[future.event].append(future.listener)
 
         # Signals
         for future in self._future_signals:

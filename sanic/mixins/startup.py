@@ -54,13 +54,13 @@ from sanic.models.handler_types import ListenerType
 from sanic.server import Signal as ServerSignal
 from sanic.server import try_use_uvloop
 from sanic.server.async_server import AsyncioServer
-from sanic.server.events import trigger_events
 from sanic.server.goodbye import get_goodbye
 from sanic.server.loop import try_windows_loop
 from sanic.server.protocols.http_protocol import HttpProtocol
 from sanic.server.protocols.websocket_protocol import WebSocketProtocol
 from sanic.server.runners import serve
 from sanic.server.socket import configure_socket, remove_unix_socket
+from sanic.startup.dependencies import run_process_event
 from sanic.worker.loader import AppLoader
 from sanic.worker.manager import WorkerManager
 from sanic.worker.multiplexer import WorkerMultiplexer
@@ -739,12 +739,10 @@ class StartupMixin(metaclass=SanicMeta):
         try:
             primary_server_info.settings.pop("main_start", None)
             primary_server_info.settings.pop("main_stop", None)
-            main_start = primary.listeners.get("main_process_start")
-            main_stop = primary.listeners.get("main_process_stop")
             app = primary_server_info.settings.pop("app")
             app.setup_loop()
             loop = new_event_loop()
-            trigger_events(main_start, loop, primary)
+            run_process_event(primary, "main_process_start", loop)
 
             socks = [
                 sock
@@ -844,8 +842,7 @@ class StartupMixin(metaclass=SanicMeta):
             primary._inspector = inspector
             primary._manager = manager
 
-            ready = primary.listeners["main_process_ready"]
-            trigger_events(ready, loop, primary)
+            run_process_event(primary, "main_process_ready", loop)
 
             workers_started = True
             manager.run()
@@ -870,7 +867,7 @@ class StartupMixin(metaclass=SanicMeta):
                 sock.close()
             socks = []
 
-            trigger_events(main_stop, loop, primary)
+            run_process_event(primary, "main_process_stop", loop, reverse=True)
 
             loop.close()
             cls._cleanup_env_vars()

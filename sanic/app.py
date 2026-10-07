@@ -84,6 +84,7 @@ from sanic.response import BaseHTTPResponse, HTTPResponse, ResponseStream
 from sanic.router import Router
 from sanic.server.websockets.impl import ConnectionClosed
 from sanic.signals import Event, Signal, SignalRouter
+from sanic.startup.dependencies import ListenerOrchestrator
 from sanic.touchup import TouchUp, TouchUpMeta
 from sanic.types.shared_ctx import SharedContext
 from sanic.worker.inspector import Inspector
@@ -152,6 +153,7 @@ class Sanic(
         "inspector_class",
         "go_fast",
         "listeners",
+        "listener_orchestrator",
         "multiplexer",
         "named_request_middleware",
         "named_response_middleware",
@@ -317,6 +319,7 @@ class Sanic(
         self.error_handler: ErrorHandler = error_handler or ErrorHandler()
         self.inspector_class: type[Inspector] = inspector_class or Inspector
         self.listeners: dict[str, list[ListenerType[Any]]] = defaultdict(list)
+        self.listener_orchestrator = ListenerOrchestrator(self)
         self.named_request_middleware: dict[str, deque[Middleware]] = {}
         self.named_response_middleware: dict[str, deque[Middleware]] = {}
         self.repl_ctx: REPLContext = REPLContext()
@@ -365,8 +368,17 @@ class Sanic(
         event: str,
         *,
         priority: int = 0,
+        name: str | None = None,
+        depends: tuple[str, ...] | list[str] | set[str] | None = None,
+        rollback: Callable[..., Any] | None = None,
+        on_failure: str = "abort",
     ) -> ListenerType[SanicVar]:
-        """项目内部接口说明。"""
+        """注册生命周期监听器。
+
+        除既有 ``priority`` 外，可通过 ``name`` / ``depends`` /
+        ``rollback`` / ``on_failure`` 声明监听器之间的前置依赖与失败策略。
+        依赖完整性与循环关系统一在启动前校验，注册阶段只做收集。
+        """
 
         try:
             _event = ListenerEvent[event.upper()]
@@ -376,16 +388,33 @@ class Sanic(
             )
             raise BadRequest(f"Invalid event: {event}. Use one of: {valid}")
 
+        is_managed = bool(name or depends or rollback is not None)
+        if is_managed:
+            self.listener_orchestrator.register(
+                _event.value,
+                listener,
+                name=name,
+                depends=depends,
+                rollback=rollback,
+                on_failure=on_failure,
+                priority=priority,
+            )
+
         if "." in _event:
+            if is_managed:
+                # 受管监听器的执行顺序由依赖计划决定，不再注册进信号路由，
+                # 避免同一监听器被执行两次。
+                return listener
             self.signal(_event.value, priority=priority)(
                 partial(self._listener, listener=listener)
             )
         else:
-            if priority:
+            if priority and not is_managed:
                 error_logger.warning(
                     f"Priority is not supported for {_event.value}"
                 )
-            self.listeners[_event.value].append(listener)
+            if not is_managed:
+                self.listeners[_event.value].append(listener)
 
         return listener
 
@@ -477,7 +506,13 @@ class Sanic(
 
     def _apply_listener(self, listener: FutureListener):
         return self.register_listener(
-            listener.listener, listener.event, priority=listener.priority
+            listener.listener,
+            listener.event,
+            priority=listener.priority,
+            name=listener.name,
+            depends=tuple(listener.depends),
+            rollback=listener.rollback,
+            on_failure=listener.on_failure,
         )
 
     def _apply_route(
@@ -1712,6 +1747,10 @@ class Sanic(
         self.signalize(self.config.TOUCHUP)
         self.finalize()
 
+        # 启动前校验监听器依赖：缺失前置或循环依赖在这里直接失败，
+        # 避免工作进程在前置步骤（如风控）尚未就绪时开始接流量。
+        self.listener_orchestrator.validate()
+
         route_names = [route.extra.ident for route in self.router.routes]
         duplicates = {
             name for name in route_names if route_names.count(name) > 1
@@ -1767,6 +1806,49 @@ class Sanic(
         reverse = concern == "shutdown"
         if loop is None:
             loop = self.loop
+
+        orchestrator = self.listener_orchestrator
+        if reverse:
+            # 停机：普通信号监听器先按逆序执行，受管步骤随后逆序执行。
+            await self._dispatch_server_event(event, loop, reverse=True)
+            await orchestrator.run_managed(event, self, loop, reverse=True)
+        else:
+            # 启动：受管步骤按依赖拓扑序先执行，普通监听器随后。
+            # 任一部分失败都按阶段逆序撤销已完成的可回滚步骤。
+            try:
+                await orchestrator.run_managed(event, self, loop)
+                await self._dispatch_server_event(event, loop)
+            except BaseException:
+                await self._rollback_startup_events(orchestrator, event, loop)
+                raise
+
+    async def _rollback_startup_events(
+        self,
+        orchestrator: ListenerOrchestrator,
+        failed_event: str,
+        loop: AbstractEventLoop,
+    ) -> None:
+        """启动阶段失败时，按阶段逆序撤销已完成的可回滚受管步骤。
+
+        启动顺序为 ``init.before`` → ``init.after``。``init.after`` 失败
+        时先撤销 after、再撤销 before；``init.before`` 失败时只撤销 before。
+        ``rollback_event`` 幂等，空计划或已撤销均为无操作。
+        """
+        phases = (
+            Event.SERVER_INIT_AFTER.value,
+            Event.SERVER_INIT_BEFORE.value,
+        )
+        failure_index = phases.index(failed_event)
+        for phase in phases[failure_index:]:
+            await orchestrator.rollback_event(phase, self, loop)
+
+    async def _dispatch_server_event(
+        self,
+        event: str,
+        loop: AbstractEventLoop,
+        *,
+        reverse: bool = False,
+    ) -> None:
         await self.dispatch(
             event,
             fail_not_found=False,
